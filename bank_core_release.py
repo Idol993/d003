@@ -48,6 +48,7 @@ class ReleaseStatus(Enum):
     PRECHECK_FAILED = "precheck_failed"
     PENDING_APPROVAL = "pending_approval"
     APPROVED = "approved"
+    APPROVED_DEPLOY_FAILED = "approved_deploy_failed"
     REJECTED = "rejected"
     DEPLOYING = "deploying"
     DEPLOYED = "deployed"
@@ -212,6 +213,8 @@ def init_db():
         status TEXT DEFAULT 'submitted',
         branch_code TEXT DEFAULT '',
         description TEXT DEFAULT '',
+        previous_stable_version TEXT DEFAULT '',
+        deploy_failure_reason TEXT DEFAULT '',
         created_at TEXT,
         updated_at TEXT
     );
@@ -289,8 +292,26 @@ def init_db():
         started_at TEXT,
         FOREIGN KEY (release_id) REFERENCES release_applications(id)
     );
+    CREATE TABLE IF NOT EXISTS monitor_runs (
+        id TEXT PRIMARY KEY,
+        release_id TEXT NOT NULL,
+        started_at TEXT,
+        stopped_at TEXT,
+        auto_rollback_enabled INTEGER DEFAULT 0,
+        mode TEXT DEFAULT 'thread',
+        FOREIGN KEY (release_id) REFERENCES release_applications(id)
+    );
     """)
     conn.commit()
+
+    try:
+        cols = [r["name"] for r in Database.query("PRAGMA table_info(release_applications)")]
+        if "previous_stable_version" not in cols:
+            Database.execute("ALTER TABLE release_applications ADD COLUMN previous_stable_version TEXT DEFAULT ''")
+        if "deploy_failure_reason" not in cols:
+            Database.execute("ALTER TABLE release_applications ADD COLUMN deploy_failure_reason TEXT DEFAULT ''")
+    except Exception:
+        pass
 
     rows = Database.query("SELECT COUNT(*) AS cnt FROM branch_registry")
     if rows[0]["cnt"] == 0:
@@ -647,7 +668,7 @@ class MonitorEngine:
         self._lock = threading.Lock()
         self._callbacks: Dict[str, Callable] = {}
 
-    def start(self, release_id: str, callback: Callable = None):
+    def start(self, release_id: str, callback: Callable = None, auto_rollback: bool = False, mode: str = "thread"):
         with self._lock:
             if release_id in self._threads and self._threads[release_id].is_alive():
                 logger.warning("Monitor already running for %s", release_id)
@@ -661,31 +682,136 @@ class MonitorEngine:
             )
             self._threads[release_id] = t
             t.start()
-        self.audit.log("MONITOR_START", "MonitorEngine", release_id, "7x24监控已启动")
-        logger.info("Monitor started for release %s", release_id)
+
+        run_id = _gen_id("monrun_")
+        Database.execute(
+            "INSERT INTO monitor_runs (id, release_id, started_at, auto_rollback_enabled, mode) VALUES (?, ?, ?, ?, ?)",
+            (run_id, release_id, _now(), 1 if auto_rollback else 0, mode),
+        )
+
+        self.audit.log("MONITOR_START", "MonitorEngine", release_id, f"7x24监控已启动 (mode={mode}, auto_rollback={auto_rollback})")
+        logger.info("Monitor started for release %s (mode=%s, auto_rollback=%s)", release_id, mode, auto_rollback)
 
     def stop(self, release_id: str):
         with self._lock:
             if release_id in self._stop_events:
                 self._stop_events[release_id].set()
             self._callbacks.pop(release_id, None)
+
+        last_run = Database.query_one(
+            "SELECT * FROM monitor_runs WHERE release_id = ? ORDER BY started_at DESC LIMIT 1",
+            (release_id,),
+        )
+        if last_run and not last_run["stopped_at"]:
+            Database.execute(
+                "UPDATE monitor_runs SET stopped_at = ? WHERE id = ?",
+                (_now(), last_run["id"]),
+            )
+
         self.audit.log("MONITOR_STOP", "MonitorEngine", release_id, "监控已停止")
         logger.info("Monitor stopped for release %s", release_id)
 
     def status(self, release_id: str) -> Dict:
         with self._lock:
-            running = (
+            thread_running = (
                 release_id in self._threads and self._threads[release_id].is_alive()
             )
-        if not running:
-            return {"release_id": release_id, "monitoring": False}
-        last = Database.query_one(
+
+        last_run = Database.query_one(
+            "SELECT * FROM monitor_runs WHERE release_id = ? ORDER BY started_at DESC LIMIT 1",
+            (release_id,),
+        )
+
+        last_snapshot = Database.query_one(
             "SELECT * FROM monitor_snapshots WHERE release_id = ? ORDER BY timestamp DESC LIMIT 1",
             (release_id,),
         )
-        if last:
-            return {"release_id": release_id, "monitoring": True, "last_snapshot": dict(last)}
-        return {"release_id": release_id, "monitoring": True, "last_snapshot": None}
+
+        active = False
+        if thread_running:
+            active = True
+        elif last_snapshot:
+            try:
+                snap_time = datetime.strptime(last_snapshot["timestamp"], "%Y-%m-%d %H:%M:%S")
+                if (datetime.now() - snap_time).total_seconds() < 120:
+                    active = True
+            except (ValueError, TypeError):
+                pass
+
+        result = {
+            "release_id": release_id,
+            "monitoring": active,
+            "thread_running": thread_running,
+            "last_snapshot": dict(last_snapshot) if last_snapshot else None,
+            "last_run": dict(last_run) if last_run else None,
+            "thresholds": MONITOR_THRESHOLDS,
+        }
+        return result
+
+    def run_foreground(self, release_id: str, callback: Callable = None, auto_rollback: bool = False) -> Dict:
+        run_id = _gen_id("monrun_")
+        Database.execute(
+            "INSERT INTO monitor_runs (id, release_id, started_at, auto_rollback_enabled, mode) VALUES (?, ?, ?, ?, ?)",
+            (run_id, release_id, _now(), 1 if auto_rollback else 0, "foreground"),
+        )
+        self.audit.log(
+            "MONITOR_START", "MonitorEngine", release_id,
+            f"前台监控已启动 (auto_rollback={auto_rollback})",
+        )
+        logger.info("Foreground monitor started for release %s", release_id)
+
+        stop_event = threading.Event()
+        if callback:
+            with self._lock:
+                self._callbacks[release_id] = callback
+
+        try:
+            while not stop_event.is_set():
+                snapshot = self._collect_snapshot(release_id)
+                self._save_snapshot(snapshot)
+
+                status_str = "正常" if snapshot["status"] == MonitorStatus.RUNNING.value else "异常"
+                print(
+                    f"[{snapshot['timestamp']}] 监控状态: {status_str} | "
+                    f"交易成功率: {snapshot['transaction_success_rate']}% | "
+                    f"账务延迟: {snapshot['accounting_delay_ms']}ms | "
+                    f"资金结算异常: {snapshot['fund_settlement_anomaly']}"
+                )
+
+                if snapshot["status"] == MonitorStatus.ANOMALY.value:
+                    self.audit.log(
+                        "MONITOR_ANOMALY", "MonitorEngine", release_id,
+                        json.dumps(snapshot, ensure_ascii=False),
+                    )
+                    if callback:
+                        try:
+                            cb_result = callback(release_id, snapshot)
+                            if auto_rollback:
+                                print("[自动回退] 已触发合规回退，监控即将退出")
+                                stop_event.set()
+                                break
+                        except Exception as e:
+                            logger.error("Monitor callback error: %s", e)
+                    elif auto_rollback:
+                        print("[自动回退] 检测到异常但未配置回退回调")
+
+                for _ in range(60):
+                    if stop_event.is_set():
+                        break
+                    time.sleep(1)
+        except KeyboardInterrupt:
+            print("\n监控已停止 (用户中断)")
+        finally:
+            Database.execute(
+                "UPDATE monitor_runs SET stopped_at = ? WHERE id = ?",
+                (_now(), run_id),
+            )
+            with self._lock:
+                self._callbacks.pop(release_id, None)
+            self.audit.log("MONITOR_STOP", "MonitorEngine", release_id, "前台监控已停止")
+            logger.info("Foreground monitor stopped for release %s", release_id)
+
+        return {"release_id": release_id, "run_id": run_id, "mode": "foreground"}
 
     def _monitor_loop(self, release_id: str, stop_event: threading.Event):
         while not stop_event.is_set():
@@ -754,22 +880,29 @@ class RollbackEngine:
         self.audit = audit_logger
         self.monitor = monitor_engine
 
-    def execute_rollback(self, release_id: str, reason: str) -> Dict:
+    def execute_rollback(self, release_id: str, reason: str, restart_monitor: bool = True) -> Dict:
         self.audit.log("ROLLBACK_START", "ReleaseApplication", release_id, f"原因: {reason}")
 
         # 1. stop monitoring
         self.monitor.stop(release_id)
 
         # 2. get release info
-        rel = Database.query_one(
+        rel_row = Database.query_one(
             "SELECT * FROM release_applications WHERE id = ?", (release_id,)
         )
-        if not rel:
+        if not rel_row:
             return {"success": False, "message": "未找到发布申请"}
+        rel = dict(rel_row)
 
         # 3. get previous stable version
-        prev_stable = self._get_previous_stable(rel["module"])
-        if not prev_stable:
+        prev_version = ""
+        if rel.get("previous_stable_version"):
+            prev_version = rel["previous_stable_version"]
+        else:
+            prev_stable = self._get_previous_stable(rel["module"])
+            if prev_stable:
+                prev_version = prev_stable["version"]
+        if not prev_version:
             return {"success": False, "message": "未找到可回退的稳定版本"}
 
         # 4. estimate affected accounts
@@ -785,7 +918,7 @@ class RollbackEngine:
         stakeholders = self._notify_stakeholders(release_id, reason)
 
         # 8. execute rollback / restore version
-        self._execute_version_restore(release_id, prev_stable["version"])
+        self._execute_version_restore(release_id, prev_version)
 
         # 9. update release status
         Database.execute(
@@ -798,32 +931,33 @@ class RollbackEngine:
         Database.execute(
             "INSERT INTO rollback_records (id, release_id, reason, previous_version, affected_accounts, regulatory_explanation, root_cause, status, created_at, notified_stakeholders) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                rb_id, release_id, reason, prev_stable["version"], affected,
+                rb_id, release_id, reason, prev_version, affected,
                 reg_explanation, root_cause, "completed", _now(),
                 json.dumps(stakeholders, ensure_ascii=False),
             ),
         )
 
-        # 11. restart 7x24 monitoring
-        self.monitor.start(release_id)
+        # 11. restart 7x24 monitoring (use release_id for tracking)
+        if restart_monitor:
+            self.monitor.start(release_id)
 
         # 12. generate rollback report
         report = self._generate_rollback_report(
-            rb_id, release_id, reason, prev_stable["version"],
+            rb_id, release_id, reason, prev_version,
             affected, reg_explanation, root_cause, stakeholders,
         )
         self.audit.log(
             "ROLLBACK_COMPLETE", "ReleaseApplication", release_id,
             json.dumps({
                 "rollback_id": rb_id,
-                "previous_version": prev_stable["version"],
+                "previous_version": prev_version,
                 "affected": affected,
             }, ensure_ascii=False),
         )
         return {
             "success": True,
             "rollback_id": rb_id,
-            "previous_version": prev_stable["version"],
+            "previous_version": prev_version,
             "affected_accounts": affected,
             "report": report,
         }
@@ -1403,6 +1537,7 @@ class ReleaseOrchestrator:
         self.drill = DrillEngine(self.audit)
         self.report = WeeklyReportEngine(self.audit)
         self.query_engine = QueryEngine(self.audit)
+        self._rollback_triggered = set()
 
     def submit_release(
         self, title: str, version: str, module: str, applicant: str,
@@ -1410,11 +1545,19 @@ class ReleaseOrchestrator:
     ) -> Dict:
         release_id = _gen_id("rel_")
         now = _now()
+
+        prev_stable_row = Database.query_one(
+            "SELECT * FROM stable_versions WHERE module = ? ORDER BY marked_at DESC LIMIT 1",
+            (module,),
+        )
+        previous_stable_version = prev_stable_row["version"] if prev_stable_row else ""
+
         Database.execute(
-            "INSERT INTO release_applications (id, title, version, module, applicant, risk_level, status, branch_code, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO release_applications (id, title, version, module, applicant, risk_level, status, branch_code, description, previous_stable_version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 release_id, title, version, module, applicant, risk_level,
-                ReleaseStatus.SUBMITTED.value, branch_code, description, now, now,
+                ReleaseStatus.SUBMITTED.value, branch_code, description,
+                previous_stable_version, now, now,
             ),
         )
         self.audit.log(
@@ -1448,7 +1591,7 @@ class ReleaseOrchestrator:
         }
 
     def approve_release(self, release_id: str, role: str, approver: str,
-                        comment: str = "") -> Dict:
+                        comment: str = "", auto_deploy: bool = False) -> Dict:
         result = self.approval.approve_node(release_id, role, approver, comment)
         if result.get("all_approved"):
             Database.execute(
@@ -1458,7 +1601,63 @@ class ReleaseOrchestrator:
             self.audit.log(
                 "FULLY_APPROVED", "ReleaseApplication", release_id, "所有审批节点已通过",
             )
+
+            if auto_deploy:
+                result["auto_deploy"] = self._try_auto_deploy(release_id)
+
         return result
+
+    def _try_auto_deploy(self, release_id: str) -> Dict:
+        try:
+            init_result = self.start_grayscale_deployment(release_id)
+            if not init_result.get("success"):
+                fail_reason = init_result.get("message", "灰度初始化失败")
+                Database.execute(
+                    "UPDATE release_applications SET status = ?, deploy_failure_reason = ?, updated_at = ? WHERE id = ?",
+                    (ReleaseStatus.APPROVED_DEPLOY_FAILED.value, fail_reason, _now(), release_id),
+                )
+                self.audit.log(
+                    "AUTO_DEPLOY_FAILED", "ReleaseApplication", release_id,
+                    json.dumps({"step": "灰度初始化", "reason": fail_reason}, ensure_ascii=False),
+                )
+                return {"success": False, "step": "灰度初始化", "reason": fail_reason}
+
+            advance_result = self.advance_grayscale(release_id)
+            if not advance_result.get("success"):
+                fail_reason = advance_result.get("message", "第一阶段推送失败")
+                Database.execute(
+                    "UPDATE release_applications SET status = ?, deploy_failure_reason = ?, updated_at = ? WHERE id = ?",
+                    (ReleaseStatus.APPROVED_DEPLOY_FAILED.value, fail_reason, _now(), release_id),
+                )
+                self.audit.log(
+                    "AUTO_DEPLOY_FAILED", "ReleaseApplication", release_id,
+                    json.dumps({"step": "第一阶段推送", "reason": fail_reason}, ensure_ascii=False),
+                )
+                return {"success": False, "step": "第一阶段推送", "reason": fail_reason}
+
+            self.audit.log(
+                "AUTO_DEPLOY_SUCCESS", "ReleaseApplication", release_id,
+                json.dumps({
+                    "phase": advance_result.get("phase", ""),
+                    "pct": advance_result.get("pct", 0),
+                }, ensure_ascii=False),
+            )
+            return {
+                "success": True,
+                "phase": advance_result.get("phase", ""),
+                "pct": advance_result.get("pct", 0),
+            }
+        except Exception as e:
+            fail_reason = f"自动部署异常: {str(e)}"
+            Database.execute(
+                "UPDATE release_applications SET status = ?, deploy_failure_reason = ?, updated_at = ? WHERE id = ?",
+                (ReleaseStatus.APPROVED_DEPLOY_FAILED.value, fail_reason, _now(), release_id),
+            )
+            self.audit.log(
+                "AUTO_DEPLOY_FAILED", "ReleaseApplication", release_id,
+                json.dumps({"step": "未知", "reason": fail_reason, "traceback": traceback.format_exc()}, ensure_ascii=False),
+            )
+            return {"success": False, "step": "未知", "reason": fail_reason}
 
     def reject_release(self, release_id: str, role: str, approver: str,
                        comment: str = "") -> Dict:
@@ -1488,6 +1687,48 @@ class ReleaseOrchestrator:
             json.dumps(snapshot, ensure_ascii=False),
         )
 
+        if release_id in self._rollback_triggered:
+            logger.warning("Rollback already triggered for release %s, skipping", release_id)
+            return
+
+        metrics_exceeded = []
+        if snapshot["transaction_success_rate"] < MONITOR_THRESHOLDS["transaction_success_rate"]:
+            metrics_exceeded.append(
+                f"交易成功率={snapshot['transaction_success_rate']}% (阈值={MONITOR_THRESHOLDS['transaction_success_rate']}%)"
+            )
+        if snapshot["accounting_delay_ms"] > MONITOR_THRESHOLDS["accounting_delay_ms"]:
+            metrics_exceeded.append(
+                f"账务延迟={snapshot['accounting_delay_ms']}ms (阈值={MONITOR_THRESHOLDS['accounting_delay_ms']}ms)"
+            )
+        if snapshot["fund_settlement_anomaly"] > MONITOR_THRESHOLDS["fund_settlement_anomaly"]:
+            metrics_exceeded.append(
+                f"资金结算异常数={snapshot['fund_settlement_anomaly']} (阈值={MONITOR_THRESHOLDS['fund_settlement_anomaly']})"
+            )
+
+        reason = "监控异常触发合规回退 - " + "; ".join(metrics_exceeded) if metrics_exceeded else "监控指标异常"
+        logger.warning("=" * 60)
+        logger.warning("  AUTO-ROLLBACK TRIGGERED for release %s", release_id)
+        logger.warning("  Reason: %s", reason)
+        logger.warning("=" * 60)
+
+        self._rollback_triggered.add(release_id)
+
+        try:
+            rb_result = self.rollback.execute_rollback(release_id, reason, restart_monitor=False)
+            if rb_result["success"]:
+                logger.warning(
+                    "Auto-rollback completed. rollback_id=%s, restored_version=%s",
+                    rb_result["rollback_id"], rb_result["previous_version"],
+                )
+                print(f"\n[自动回退] 回退ID: {rb_result['rollback_id']}")
+                print(f"[自动回退] 触发指标: {'; '.join(metrics_exceeded) if metrics_exceeded else 'N/A'}")
+                print(f"[自动回退] 恢复版本: {rb_result['previous_version']}")
+            else:
+                logger.error("Auto-rollback failed: %s", rb_result.get("message", "unknown"))
+        except Exception as e:
+            logger.error("Auto-rollback exception: %s", e)
+            logger.error(traceback.format_exc())
+
     def trigger_rollback(self, release_id: str, reason: str) -> Dict:
         return self.rollback.execute_rollback(release_id, reason)
 
@@ -1503,6 +1744,93 @@ class ReleaseOrchestrator:
         excel_path = self.report.generate_excel_report(stats)
         chart_path = self.report.generate_trend_chart([stats])
         return {"stats": stats, "pdf": pdf_path, "excel": excel_path, "chart": chart_path}
+
+    def _get_last_week_range(self, day_of_week: int = 0) -> str:
+        today = datetime.now()
+        days_since_target = (today.weekday() - day_of_week) % 7
+        if days_since_target == 0:
+            days_since_target = 7
+        last_target_day = today - timedelta(days=days_since_target)
+        week_start = last_target_day.strftime("%Y-%m-%d")
+        return week_start
+
+    def _get_next_run_time(self, day_of_week: int = 0) -> datetime:
+        today = datetime.now()
+        days_until_target = (day_of_week - today.weekday()) % 7
+        if days_until_target == 0:
+            if today.hour >= 1:
+                days_until_target = 7
+        next_run = today + timedelta(days=days_until_target)
+        next_run = next_run.replace(hour=0, minute=0, second=0, microsecond=0)
+        return next_run
+
+    def run_scheduler(self, mode: str = "foreground", day_of_week: int = 0) -> Dict:
+        day_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+        day_name = day_names[day_of_week] if 0 <= day_of_week < 7 else "周一"
+
+        if mode == "once":
+            week_start = self._get_last_week_range(day_of_week)
+            print(f"[调度器] 立即生成周报，周期起始: {week_start}")
+            result = self.generate_weekly_report(week_start)
+            self.audit.log(
+                "SCHEDULER_REPORT", "Scheduler", "",
+                json.dumps({
+                    "mode": "once",
+                    "week_start": week_start,
+                    "pdf": result.get("pdf", ""),
+                    "excel": result.get("excel", ""),
+                    "chart": result.get("chart", ""),
+                }, ensure_ascii=False),
+            )
+            return {"mode": "once", "week_start": week_start, "report": result}
+
+        next_run = self._get_next_run_time(day_of_week)
+        print(f"[调度器] 前台模式启动")
+        print(f"[调度器] 报告日: 每周{day_name}")
+        print(f"[调度器] 下次运行时间: {next_run.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"[调度器] 按 Ctrl+C 退出")
+
+        last_generated_week = None
+
+        try:
+            while True:
+                now = datetime.now()
+                is_target_day = now.weekday() == day_of_week
+                is_trigger_hour = 0 <= now.hour < 1
+
+                week_start = self._get_last_week_range(day_of_week)
+
+                if is_target_day and is_trigger_hour and last_generated_week != week_start:
+                    print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] 触发每周报告生成...")
+                    try:
+                        result = self.generate_weekly_report(week_start)
+                        last_generated_week = week_start
+                        print(f"  报告周期: {result['stats']['week_start']} 至 {result['stats']['week_end']}")
+                        print(f"  PDF: {result.get('pdf', 'N/A')}")
+                        print(f"  Excel: {result.get('excel', 'N/A')}")
+                        print(f"  趋势图: {result.get('chart', 'N/A')}")
+                        self.audit.log(
+                            "SCHEDULER_REPORT", "Scheduler", "",
+                            json.dumps({
+                                "mode": "foreground",
+                                "week_start": week_start,
+                                "pdf": result.get("pdf", ""),
+                                "excel": result.get("excel", ""),
+                                "chart": result.get("chart", ""),
+                            }, ensure_ascii=False),
+                        )
+                        next_run = self._get_next_run_time(day_of_week)
+                        print(f"  下次运行时间: {next_run.strftime('%Y-%m-%d %H:%M:%S')}")
+                    except Exception as e:
+                        logger.error("Weekly report generation failed: %s", e)
+                        logger.error(traceback.format_exc())
+
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            print("\n[调度器] 已停止")
+            return {"mode": "foreground", "stopped": True}
+
+        return {"mode": "foreground", "stopped": True}
 
     def generate_audit_excel(self) -> str:
         rows = Database.query("SELECT * FROM audit_log_chain ORDER BY id ASC")
@@ -1538,15 +1866,21 @@ class ReleaseOrchestrator:
     def verify_audit_integrity(self) -> Dict:
         return self.audit.verify_integrity()
 
-    def monitor_action(self, release_id: str, action: str) -> Dict:
+    def monitor_action(self, release_id: str, action: str, auto_rollback: bool = False) -> Dict:
         if action == "start":
-            self.monitor.start(release_id, callback=self._on_monitor_anomaly)
-            return {"success": True, "action": "start", "release_id": release_id}
+            self.monitor.start(release_id, callback=self._on_monitor_anomaly, auto_rollback=auto_rollback, mode="thread")
+            return {"success": True, "action": "start", "release_id": release_id, "auto_rollback": auto_rollback}
         elif action == "stop":
             self.monitor.stop(release_id)
             return {"success": True, "action": "stop", "release_id": release_id}
         elif action == "status":
             return self.monitor.status(release_id)
+        elif action == "run":
+            return self.monitor.run_foreground(
+                release_id,
+                callback=self._on_monitor_anomaly,
+                auto_rollback=auto_rollback,
+            )
         else:
             return {"success": False, "message": f"未知监控操作: {action}"}
 
@@ -1584,43 +1918,85 @@ def run_demo():
         print(f"  审批节点: {[n['role'] for n in result['approval_nodes']]}")
 
     if result["success"]:
-        print("\n[2] 审批流程...")
-        for node in result["approval_nodes"]:
+        rel_info = orch.get_release(release_id)
+        print(f"  前一稳定版本: {rel_info.get('previous_stable_version', 'N/A')}")
+
+        print("\n[2] 审批流程 (最后一个节点自动部署)...")
+        nodes = result["approval_nodes"]
+        for i, node in enumerate(nodes):
+            is_last = i == len(nodes) - 1
             apr = orch.approve_release(
                 release_id, node["role"], f"{node['role']}负责人", "同意发布",
+                auto_deploy=is_last,
             )
             print(f"  {node['role']}: {'已批准' if apr['success'] else '审批失败'}")
             if apr.get("all_approved"):
                 print("  ✓ 全部审批通过")
+                if apr.get("auto_deploy"):
+                    ad = apr["auto_deploy"]
+                    if ad.get("success"):
+                        print(f"  ✓ 自动部署成功: 阶段={ad.get('phase')}, 比例={ad.get('pct')}%")
+                    else:
+                        print(f"  ✗ 自动部署失败: 步骤={ad.get('step')}, 原因={ad.get('reason')}")
 
-        print("\n[3] 灰度发布...")
-        deploy = orch.start_grayscale_deployment(release_id)
-        print(f"  灰度初始化: {'成功' if deploy['success'] else '失败'}")
-
-        phase_names = ["5%", "20%", "50%", "100%"]
-        for name in phase_names:
-            adv = orch.advance_grayscale(release_id)
-            branches_count = len(adv.get("branches_deployed", []))
-            is_final = adv.get("is_final", False)
-            print(f"  阶段 {name}: branches={branches_count}, 完成={is_final}")
-            if is_final:
-                print("  ✓ 灰度发布完成")
+        print("\n[3] 灰度发布 (继续推进)...")
+        rel = orch.get_release(release_id)
+        current_status = rel.get("status", "")
+        phase_names = ["20%", "50%", "100%"]
+        if current_status in [ReleaseStatus.DEPLOYING.value, ReleaseStatus.APPROVED_DEPLOY_FAILED.value]:
+            if current_status == ReleaseStatus.APPROVED_DEPLOY_FAILED.value:
+                print(f"  当前状态: 审批通过但部署失败 ({rel.get('deploy_failure_reason', '')})")
+                print("  重新初始化部署...")
+                orch.start_grayscale_deployment(release_id)
+            for name in phase_names:
+                adv = orch.advance_grayscale(release_id)
+                branches_count = len(adv.get("branches_deployed", []))
+                is_final = adv.get("is_final", False)
+                print(f"  阶段 {name}: branches={branches_count}, 完成={is_final}")
+                if is_final:
+                    print("  ✓ 灰度发布完成")
+        else:
+            deploy = orch.start_grayscale_deployment(release_id)
+            print(f"  灰度初始化: {'成功' if deploy['success'] else '失败'}")
+            phase_names_all = ["5%", "20%", "50%", "100%"]
+            for name in phase_names_all:
+                adv = orch.advance_grayscale(release_id)
+                branches_count = len(adv.get("branches_deployed", []))
+                is_final = adv.get("is_final", False)
+                print(f"  阶段 {name}: branches={branches_count}, 完成={is_final}")
+                if is_final:
+                    print("  ✓ 灰度发布完成")
 
         print("\n[4] 监控状态...")
         time.sleep(2)
         ms = orch.monitor_action(release_id, "status")
-        print(f"  监控状态: {ms}")
+        print(f"  监控运行中: {ms.get('monitoring', False)}")
+        print(f"  线程运行中: {ms.get('thread_running', False)}")
+        if ms.get("last_snapshot"):
+            snap = ms["last_snapshot"]
+            print(f"  最近快照: 成功率={snap['transaction_success_rate']}%, 延迟={snap['accounting_delay_ms']}ms")
+        if ms.get("last_run"):
+            run = ms["last_run"]
+            print(f"  最近运行: 启动于={run.get('started_at', 'N/A')}, 模式={run.get('mode', 'N/A')}")
+        print(f"  阈值配置: {ms.get('thresholds', {})}")
 
-        print("\n[5] 模拟异常回退...")
-        os.environ["simulate_anomaly"] = "true"
+        print("\n[5] 模拟异常回退 (验证回退到前一稳定版本)...")
+        rel_before = orch.get_release(release_id)
+        print(f"  当前版本: {rel_before['version']}")
+        print(f"  前一稳定版本 (记录): {rel_before.get('previous_stable_version', 'N/A')}")
         rb = orch.trigger_rollback(release_id, "交易成功率低于阈值，触发合规回退")
         print(f"  回退结果: {'成功' if rb['success'] else '失败'}")
         if rb["success"]:
-            print(f"  回退版本: {rb['previous_version']}")
+            print(f"  回退ID: {rb['rollback_id']}")
+            print(f"  恢复版本: {rb['previous_version']}")
             print(f"  影响账户: {rb['affected_accounts']}")
+            print(f"  报告中的恢复版本: {rb['report']['restored_version']}")
+            assert rb["previous_version"] == rb["report"]["restored_version"], "回退版本不一致!"
+            print(f"  ✓ 回退版本与报告版本一致")
+            assert rb["previous_version"] == rel_before.get("previous_stable_version", ""), "回退版本与记录的前一稳定版本不一致!"
+            print(f"  ✓ 回退版本与记录的前一稳定版本一致")
             explanation = rb["report"]["regulatory_compliance"]["explanation"][:80]
             print(f"  监管说明: {explanation}...")
-        os.environ.pop("simulate_anomaly", None)
 
     print("\n[6] 演练管理...")
     drill = orch.create_drill("核心系统灾备切换演练", "主数据中心故障切换")
@@ -1652,8 +2028,26 @@ def run_demo():
         exp = orch.batch_export([r["id"] for r in releases], "zip")
         print(f"  导出路径: {exp}")
 
+    print("\n[10] 调度器 (立即生成模式演示)...")
+    sched_result = orch.run_scheduler(mode="once", day_of_week=0)
+    if sched_result.get("report"):
+        rpt = sched_result["report"]
+        print(f"  周起始: {sched_result.get('week_start', 'N/A')}")
+        print(f"  发布数: {rpt['stats']['release_count']}")
+        print(f"  成功率: {rpt['stats']['success_rate']}%")
+        print(f"  PDF报告: {rpt.get('pdf', 'N/A')}")
+        print(f"  Excel报告: {rpt.get('excel', 'N/A')}")
+        print(f"  趋势图: {rpt.get('chart', 'N/A')}")
+
     print("\n" + "=" * 60)
     print("  全流程演示完成!")
+    print()
+    print("  新增功能:")
+    print("  1. 监控异常自动触发合规回退")
+    print("  2. 回退恢复到前一稳定版本 (而非当前版本)")
+    print("  3. 前台监控模式 (monitor --action run --auto-rollback)")
+    print("  4. 审批通过后自动部署 (approve --auto-deploy)")
+    print("  5. 周报调度器 (scheduler --mode foreground/once --day 0)")
     print("=" * 60)
 
 
@@ -1682,6 +2076,7 @@ def main():
     sub_approve.add_argument("--role", required=True, help="审批角色")
     sub_approve.add_argument("--approver", required=True, help="审批人")
     sub_approve.add_argument("--comment", default="同意", help="审批意见")
+    sub_approve.add_argument("--auto-deploy", action="store_true", help="审批通过后自动部署")
 
     sub_reject = subparsers.add_parser("reject", help="拒绝发布")
     sub_reject.add_argument("--release-id", required=True, help="发布ID")
@@ -1698,7 +2093,8 @@ def main():
 
     sub_monitor = subparsers.add_parser("monitor", help="监控管理")
     sub_monitor.add_argument("--release-id", required=True, help="发布ID")
-    sub_monitor.add_argument("--action", required=True, choices=["start", "stop", "status"], help="操作")
+    sub_monitor.add_argument("--action", required=True, choices=["start", "stop", "status", "run"], help="操作")
+    sub_monitor.add_argument("--auto-rollback", action="store_true", help="检测到异常时自动回退")
 
     sub_drill = subparsers.add_parser("drill", help="演练管理")
     sub_drill.add_argument("--action", required=True, choices=["create", "execute"], help="操作")
@@ -1722,6 +2118,10 @@ def main():
 
     sub_demo = subparsers.add_parser("demo", help="运行全流程演示")
 
+    sub_scheduler = subparsers.add_parser("scheduler", help="周报调度器")
+    sub_scheduler.add_argument("--mode", default="foreground", choices=["foreground", "once"], help="运行模式")
+    sub_scheduler.add_argument("--day", type=int, default=0, help="每周几生成 (0=周一, 1=周二, ..., 6=周日)")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1742,6 +2142,7 @@ def main():
     elif args.command == "approve":
         result = orch.approve_release(
             args.release_id, args.role, args.approver, args.comment,
+            auto_deploy=args.auto_deploy,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
 
@@ -1756,7 +2157,7 @@ def main():
         if not rel:
             print(json.dumps({"error": "未找到发布申请"}, ensure_ascii=False))
             return
-        if rel["status"] == ReleaseStatus.APPROVED.value:
+        if rel["status"] in [ReleaseStatus.APPROVED.value, ReleaseStatus.APPROVED_DEPLOY_FAILED.value]:
             orch.start_grayscale_deployment(args.release_id)
         result = orch.advance_grayscale(args.release_id)
         print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
@@ -1766,7 +2167,7 @@ def main():
         print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
 
     elif args.command == "monitor":
-        result = orch.monitor_action(args.release_id, args.action)
+        result = orch.monitor_action(args.release_id, args.action, auto_rollback=args.auto_rollback)
         print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
 
     elif args.command == "drill":
@@ -1803,6 +2204,11 @@ def main():
 
     elif args.command == "demo":
         run_demo()
+
+    elif args.command == "scheduler":
+        result = orch.run_scheduler(mode=args.mode, day_of_week=args.day)
+        if args.mode == "once":
+            print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
 
 
 if __name__ == "__main__":
